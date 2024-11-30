@@ -1,4 +1,8 @@
 import torch
+from fontTools.varLib.instancer import solver
+
+from anode.models import ODEBlock
+
 torch.cuda.empty_cache()
 import torch.nn as nn
 import numpy as np
@@ -24,9 +28,10 @@ class Args:
 
 def create_args():
     args = Args()
+    args.solver = str(input("Solver Options: anode; flows (default: NODE): ") or None)
     args.dataset = input("Name of the data set. Options: EMT; Lineage; Bifurcation; Simulation (default: EMT): ") or 'EMT'
     timepoints = input("Time points of data (default: 0, 0.1, 0.3, 0.9, 2.1): ")
-    args.timepoints = [float(tp.strip()) for tp in timepoints.split(",")] if timepoints else [0, 0.1, 0.3, 0.9, 2.1]
+    args.timepoints = [float(tp.strip()) for tp in timepoints.split(",")] if timepoints else [0,.1,.3,.9,2.1]
     args.niters = int(input("Number of training iterations (default: 5000): ") or 5000)
     args.lr = float(input("Learning rate (default: 3e-3): ") or 3e-3)
     args.num_samples = int(input("Number of sampling points per epoch (default: 100): ") or 100)
@@ -41,13 +46,15 @@ def create_args():
 
 
 class UOT(nn.Module):
-    def __init__(self, in_out_dim, hidden_dim, n_hiddens, activation):
+    def __init__(self, in_out_dim, hidden_dim, n_hiddens, activation, solver):
         super().__init__()
         self.in_out_dim = in_out_dim
         self.hidden_dim = hidden_dim
-        self.hyper_net1 = HyperNetwork1(in_out_dim, hidden_dim, n_hiddens,activation) #v= dx/dt
-        self.hyper_net2 = HyperNetwork2(in_out_dim, hidden_dim, activation) #g
-
+        self.aug_dim = 1 if solver == "anode" else 0
+        self.hyper_net1 = HyperNetwork1(in_out_dim, hidden_dim, n_hiddens,activation, solver) #v= dx/dt
+        self.hyper_net2 = HyperNetwork2(in_out_dim, hidden_dim, activation, solver) #g
+        self.fc1 = nn.Linear(in_out_dim + self.aug_dim, in_out_dim)
+        self.solver = solver
     def forward(self, t, states):
         z = states[0]
         g_z = states[1]
@@ -64,7 +71,11 @@ class UOT(nn.Module):
 
             dlogp_z_dt = g - trace_df_dz(dz_dt, z).view(batchsize, 1)
 
+
         return (dz_dt, g, dlogp_z_dt)
+
+    def cast(self, z):
+        return self.fc1(z)
 
 
 def trace_df_dz(f, z):
@@ -78,14 +89,18 @@ def trace_df_dz(f, z):
     return sum_diag.contiguous()
 
 
+
 class HyperNetwork1(nn.Module):
     # input x, t to get v= dx/dt
-    def __init__(self, in_out_dim, hidden_dim, n_hiddens, activation='Tanh'):
+    def __init__(self, in_out_dim, hidden_dim, n_hiddens, activation='Tanh', solver=None):
+        aug_dim = 0
+        if solver == "anode":
+            aug_dim = 1
         super().__init__()
-        Layers = [in_out_dim+1]
+        Layers = [in_out_dim+1+aug_dim]
         for i in range(n_hiddens):
             Layers.append(hidden_dim)
-        Layers.append(in_out_dim)
+        Layers.append(in_out_dim + aug_dim)
         
         if activation == 'Tanh':
             self.activation = nn.Tanh()
@@ -128,7 +143,10 @@ class HyperNetwork1(nn.Module):
 
 class HyperNetwork2(nn.Module):
     # input x, t to get g
-    def __init__(self, in_out_dim, hidden_dim, activation='Tanh'):
+    def __init__(self, in_out_dim, hidden_dim, activation='Tanh', solver=None):
+        aug_dim = 0
+        if solver == "anode":
+            aug_dim = 1
         super().__init__()
         if activation == 'Tanh':
             self.activation = nn.Tanh()
@@ -140,7 +158,7 @@ class HyperNetwork2(nn.Module):
             self.activation = nn.LeakyReLU()
 
         self.net = nn.Sequential(
-            nn.Linear(in_out_dim+1, hidden_dim),
+            nn.Linear(in_out_dim+1 + aug_dim, hidden_dim),
             self.activation,
             nn.Linear(hidden_dim,hidden_dim),
             self.activation,
@@ -235,8 +253,9 @@ def trans_loss(t,y,func,device,odeint_setp):
     y_0 = torch.zeros(g.shape).type(torch.float32).to(device)
     y_00 = torch.zeros(v.shape).type(torch.float32).to(device)
     g_growth = partial(ggrowth,func=func,device=device)
+    y0 = (y_00,y_0,y_0)
     if torch.is_nonzero(t):
-        _,_, exp_g = odeint(g_growth, (y_00,y_0,y_0), torch.tensor([0,t]).type(torch.float32).to(device),atol=1e-5,rtol=1e-5,method='midpoint',options = {'step_size': odeint_setp})
+        _,_, exp_g = odeint(g_growth, y0, torch.tensor([0,t]).type(torch.float32).to(device),atol=1e-5,rtol=1e-5,method='midpoint',options = {'step_size': odeint_setp})
         f_int = (torch.norm(v,dim=1)**2+torch.norm(g,dim=1)**2).unsqueeze(1)*torch.exp(exp_g[-1])
         return (y_00,y_0,f_int)
     else:
@@ -255,7 +274,7 @@ def gcd_list(numbers):
     return gcd_value
 
 
-def train_model(mse,func,args,data_train,train_time,integral_time,sigma_now,options,device,itr):
+def train_model(mse,func,args,data_train,train_time,integral_time,sigma_now,options,device,itr, solver=None):
     warnings.filterwarnings("ignore")
 
     loss = 0
@@ -269,15 +288,17 @@ def train_model(mse,func,args,data_train,train_time,integral_time,sigma_now,opti
         g_t1 = logp_diff_t1
         options.update({'t0': integral_time[i+1]})
         options.update({'t1': integral_time[0]})
-        z_t0, g_t0, logp_diff_t0 = odesolve(func,y0=(x, g_t1, logp_diff_t1),options=options)
-        aa = MultimodalGaussian_density(z_t0, train_time, 0, data_train,sigma_now,device) #normalized density
+        x_aug = x
+        if solver == "anode":
+          x_aug = torch.cat([x,torch.zeros(x.shape[0],1)],1)
+        z_t0, g_t0, logp_diff_t0 = odesolve(func,y0=(x_aug, g_t1, logp_diff_t1),options=options)
+        z_t0 = func.cast(z_t0)
+        aa = MultimodalGaussian_density(z_t0, train_time, 0, data_train,sigma_now,device)#normalized density
         
         zero_den = (aa < 1e-16).nonzero(as_tuple=True)[0]
         aa[zero_den] = torch.tensor(1e-16).type(torch.float32).to(device)
         logp_x = torch.log(aa)-logp_diff_t0.view(-1)
-        
-        aaa = MultimodalGaussian_density(x, train_time, i+1, data_train,sigma_now,device) * torch.tensor(data_train[i+1].shape[0]/data_train[0].shape[0]) # mass
-        
+        aaa = MultimodalGaussian_density(x, train_time, i+1, data_train,sigma_now,device) * torch.tensor(data_train[i+1].shape[0]/data_train[0].shape[0]) # distribution of next time point for loss
         L2_value1[0][i] = mse(aaa,torch.exp(logp_x.view(-1)))
         
         loss = loss  + L2_value1[0][i]*1e4 
@@ -285,7 +306,8 @@ def train_model(mse,func,args,data_train,train_time,integral_time,sigma_now,opti
         # loss between each two time points
         options.update({'t0': integral_time[i+1]})
         options.update({'t1': integral_time[i]})
-        z_t0, g_t0, logp_diff_t0= odesolve(func,y0=(x, g_t1, logp_diff_t1),options=options)
+        z_t0, g_t0, logp_diff_t0= odesolve(func,y0=(x_aug, g_t1, logp_diff_t1),options=options)
+        z_t0 = func.cast(z_t0)
         
         aa = MultimodalGaussian_density(z_t0, train_time, i, data_train,sigma_now,device)* torch.tensor(data_train[i].shape[0]/data_train[0].shape[0])
         
@@ -300,7 +322,9 @@ def train_model(mse,func,args,data_train,train_time,integral_time,sigma_now,opti
         
     # compute transport cost efficiency
     transport_cost = partial(trans_loss,func=func,device=device,odeint_setp=odeint_setp)
-    x0 = Sampling(args.num_samples,train_time,0,data_train,0.02,device) 
+    x0 = Sampling(args.num_samples,train_time,0,data_train,0.02,device)
+    if solver == "anode":
+        x0 = torch.cat([x0, torch.zeros(x0.shape[0], 1)], 1)
     logp_diff_t00 = torch.zeros(x0.shape[0], 1).type(torch.float32).to(device)
     g_t00 = logp_diff_t00
     _,_,loss1 = odeint(transport_cost,y0=(x0, g_t00, logp_diff_t00),t = torch.tensor([0, integral_time[-1]]).type(torch.float32).to(device),atol=1e-5,rtol=1e-5,method='midpoint',options = {'step_size': odeint_setp})
@@ -329,7 +353,7 @@ def plot_3d(func,data_train,train_time,integral_time,args,device):
     t_list2 = [] 
     odeint_setp = gcd_list([num * 100 for num in integral_time])/100
     integral_time2 = np.arange(integral_time[0], integral_time[-1]+odeint_setp, odeint_setp)
-    integral_time2 = np.round_(integral_time2, decimals = 2)
+    integral_time2 = np.round(integral_time2, decimals = 2)
     plot_time = list(reversed(integral_time2))
     sample_time = np.where(np.isin(np.array(plot_time),integral_time))[0]
     sample_time = list(reversed(sample_time))
@@ -341,10 +365,31 @@ def plot_3d(func,data_train,train_time,integral_time,args,device):
 
             z_t_data.append(z_t0.cpu().detach().numpy())
             t_list2.append(integral_time[i])
-        
+
         # traj backward
-        z_t0 =  Sampling(viz_samples, train_time, len(train_time)-1,data_train,sigma_a,device)
-        #z_t0 = z_t0[z_t0[:,2]>1]
+        #z_t0 =  Sampling(viz_samples, train_time, len(train_time)-1,data_train,sigma_a,device)
+        z_t0 = torch.tensor([[ 1.2160, -1.5318,  0.4061],
+        [ 1.3727, -1.1170, -0.6907],
+        [ 1.3778, -0.9051, -0.7036],
+        [ 0.9926, -0.8855,  0.1159],
+        [-1.1105,  1.4849,  0.6545],
+        [-0.7696, -0.0236, -0.1433],
+        [ 0.4710, -0.6524, -0.2866],
+        [ 1.4871, -0.7218, -0.2898],
+        [ 1.4054,  0.0519, -0.2824],
+        [ 1.2953, -0.6107,  0.2766],
+        [-0.0512, -0.9535, -0.1313],
+        [ 1.2892, -1.2279, -0.1700],
+        [ 1.2163, -1.3499, -0.3499],
+        [ 1.3839, -0.6492, -0.2373],
+        [ 1.3187, -0.8242, -0.1248],
+        [-0.3580,  0.7782,  0.1324],
+        [ 1.4850, -0.3693, -0.1929],
+        [ 1.3346, -0.8329, -0.3222],
+        [ 1.3854, -0.0087,  0.4608],
+        [ 0.8726, -0.8004,  1.1379]])
+        if args.solver == "anode":
+            z_t0 = torch.cat([z_t0, torch.zeros(z_t0.shape[0], 1)], 1)
         logp_diff_t0 = torch.zeros(z_t0.shape[0], 1).type(torch.float32).to(device)
         g0 = torch.zeros(z_t0.shape[0], 1).type(torch.float32).to(device)
         v_t = func(torch.tensor(integral_time[-1]).type(torch.float32).to(device),(z_t0,g0, logp_diff_t0))[0] #True_v(z_t0)
@@ -367,8 +412,11 @@ def plot_3d(func,data_train,train_time,integral_time,args,device):
         options.update({'t1': 0})
         options.update({'t_eval':plot_time})
         z_t1,_, logp_diff_t1= odesolve(func,y0=(z_t0,g0, logp_diff_t0),options=options)
+        z_t1 = func.cast(z_t1)
+        if args.solver == "anode":
+            z_t1 = torch.cat([z_t1,torch.zeros(z_t1.shape[0], z_t1.shape[1],1)],2)
         for i in range(len(plot_time)-1):
-            v_t = func(torch.tensor(plot_time[i+1]).type(torch.float32).to(device),(z_t1[i+1], g0, logp_diff_t1))[0] #True_v(z_t0)
+            v_t = func.cast(func(torch.tensor(plot_time[i+1]).type(torch.float32).to(device),(z_t1[i+1], g0, logp_diff_t1))[0]) #True_v(z_t0)
             g_t = func(torch.tensor(plot_time[i+1]).type(torch.float32).to(device),(z_t1[i+1], g0, logp_diff_t1))[1]
             
             z_t_samples.append(z_t1[i+1].cpu().detach().numpy())
@@ -393,21 +441,21 @@ def plot_3d(func,data_train,train_time,integral_time,args,device):
         plt.axis('off')
         plt.margins(0, 0)
         #fig.suptitle(f'{t:.1f}day')
-        ax1 = plt.axes(projection ='3d')
+        ax1 = plt.axes(projection='3d')
         ax1.grid(False)
         ax1.set_xlabel('UMAP1')
         ax1.set_ylabel('UMAP2')
         ax1.set_zlabel('UMAP3')
-        ax1.set_xlim(-2,2)
-        ax1.set_ylim(-2,2)
-        ax1.set_zlim(-2,2)
-        ax1.set_xticks([-2,2])
-        ax1.set_yticks([-2,2])
-        ax1.set_zticks([-2,2])
+        ax1.set_xlim(-2, 2)
+        ax1.set_ylim(-2, 2)
+        ax1.set_zlim(-2, 2)
+        ax1.set_xticks([-2, 2])
+        ax1.set_yticks([-2, 2])
+        ax1.set_zticks([-2, 2])
         ax1.view_init(elev=angle1, azim=angle2)
-        ax1.w_xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
-        ax1.w_yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
-        ax1.w_zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax1.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax1.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax1.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
         ax1.invert_xaxis()
         ax1.get_proj = lambda: np.dot(Axes3D.get_proj(ax1), np.diag([1, 1, 0.7, 1]))
         line_width = 0.3
@@ -422,25 +470,35 @@ def plot_3d(func,data_train,train_time,integral_time,args,device):
                         np.array([3,149,198])/255,
                         np.array([180,180,213])/255,
                         np.array([178,143,237])/255]
+        z_t_samples = np.array(z_t_samples)
+        #if args.solver == "anode":
+            #z_t_samples[:, :, -1] = 0
         for j in range(viz_samples): #individual traj
             for i in range(len(plot_time)-1):
-                ax1.plot([z_t_samples[i][j,0],z_t_samples[i+1][j,0]],
-                            [z_t_samples[i][j,1],z_t_samples[i+1][j,1]],
-                            [z_t_samples[i][j,2],z_t_samples[i+1][j,2]],
-                            linewidth=0.5,color ='grey',zorder=2)
+                ax1.plot([z_t_samples[i][j, 0], z_t_samples[i + 1][j, 0]],
+                         [z_t_samples[i][j, 1], z_t_samples[i + 1][j, 1]],
+                         [z_t_samples[i][j, 2], z_t_samples[i + 1][j, 2]],
+                         linewidth=0.5, color='grey', zorder=2)
 
                         
         # add inferrred trajecotry
-        for i in range(len(sample_time)):
-            ax1.scatter(z_t_samples[sample_time[i]][:,0],z_t_samples[sample_time[i]][:,1],z_t_samples[sample_time[i]][:,2],s=aa*10,linewidth=0, color=color_wanted[i],zorder=3)
-            ax1.quiver(z_t_samples[sample_time[i]][:,0],z_t_samples[sample_time[i]][:,1],z_t_samples[sample_time[i]][:,2],
-                       v[sample_time[i]][:,0]/v_scale,v[sample_time[i]][:,1]/v_scale,v[sample_time[i]][:,2]/v_scale, color='k',alpha=1,linewidths=widths*2,arrow_length_ratio=0.3,zorder=4)
 
-                
+        for i in range(len(sample_time)):
+            ax1.scatter(z_t_samples[sample_time[i]][:, 0], z_t_samples[sample_time[i]][:, 1],
+                        z_t_samples[sample_time[i]][:, 2], s=aa * 10, linewidth=0, color=color_wanted[i], zorder=3)
+            ax1.quiver(z_t_samples[sample_time[i]][:, 0], z_t_samples[sample_time[i]][:, 1],
+                       z_t_samples[sample_time[i]][:, 2],
+                       v[sample_time[i]][:, 0] / v_scale, v[sample_time[i]][:, 1] / v_scale,
+                       v[sample_time[i]][:, 2] / v_scale, color='k', alpha=1, linewidths=widths * 2,
+                       arrow_length_ratio=0.3, zorder=4)
+
+
+        z_t_data = [np.array(i) for i in z_t_data]
+        z_t_data = [torch.cat([torch.tensor(i), torch.zeros(i.shape[0], 1)], 1) for i in z_t_data]
         for i in range(len(integral_time)):
             ax1.scatter(z_t_data[i][:,0],z_t_data[i][:,1],z_t_data[i][:,2],s=aa,linewidth=line_width,alpha = 0.7, facecolors='none', edgecolors=color_wanted[i],zorder=1)
 
-        #plt.savefig(os.path.join(args.save_dir, f"traj_3d.pdf"),format="pdf",pad_inches=0.1, bbox_inches='tight')
+        plt.savefig(os.path.join(args.save_dir, f"traj_3d.pdf"),format="pdf",pad_inches=0.1, bbox_inches='tight')
         plt.show()
             
             

@@ -29,13 +29,13 @@ if __name__ == '__main__':
 
 
     # model
-    func = UOT(in_out_dim=data_train[0].shape[1], hidden_dim=args.hidden_dim,n_hiddens=args.n_hiddens,activation=args.activation).to(device)
+    func = UOT(in_out_dim=data_train[0].shape[1], hidden_dim=args.hidden_dim,n_hiddens=args.n_hiddens,activation=args.activation, solver=args.solver).to(device)
 
     
     if args.save_dir is not None:
         if not os.path.exists(args.save_dir):
             os.makedirs(args.save_dir)
-        ckpt_path = os.path.join(args.save_dir, 'ckpt.pth')
+        ckpt_path = os.path.join(args.save_dir, 'ckpt_itr100.pth')
         if os.path.exists(ckpt_path):
             checkpoint = torch.load(ckpt_path,map_location=torch.device('cpu'))
             func.load_state_dict(checkpoint['func_state_dict'])
