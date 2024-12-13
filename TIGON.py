@@ -30,7 +30,10 @@ if __name__ == '__main__':
 
 
     # model
-    func = UOT(in_out_dim=data_train[0].shape[1], hidden_dim=args.hidden_dim,n_hiddens=args.n_hiddens,activation=args.activation, solver=args.solver).to(device)
+    if args.solver != "flow":
+        func = UOT(in_out_dim=data_train[0].shape[1], hidden_dim=args.hidden_dim,n_hiddens=args.n_hiddens,device=device,activation=args.activation,solver = args.solver).to(device)
+    else:
+        func = UOTFlow(in_out_dim=data_train[0].shape[1], hidden_dim=args.hidden_dim, n_hiddens=args.n_hiddens, activation='TimeTanh').to(device)
     func.apply(initialize_weights)
 
 
@@ -53,31 +56,38 @@ if __name__ == '__main__':
     L2_2 = []
     Trans = []
     Sigma = []
+    sigma_now = 1
+    times = []
     
     if args.save_dir is not None:
         if not os.path.exists(args.save_dir):
             os.makedirs(args.save_dir)
-        ckpt_path = os.path.join(args.save_dir, 'temp.pth')
+        ckpt_path = os.path.join(args.save_dir, 'ckpt.pth')
         if os.path.exists(ckpt_path):
             checkpoint = torch.load(ckpt_path)
             func.load_state_dict(checkpoint['func_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            sigma_now = checkpoint['Sigma'][-1] if len(checkpoint['Sigma']) > 0 else 1
+            LOSS = checkpoint['LOSS']
+            L2_1 = checkpoint['L2_1']
+            L2_2 = checkpoint['L2_2']
+            Trans = checkpoint['TRANS']
+            Sigma = checkpoint['Sigma']
+            times = checkpoint['times']
             print('Loaded ckpt from {}'.format(ckpt_path))
 
+    train = train_flow if args.solver == "flow" else train_model
     try:
-        sigma_now = 1
-        times = []
         for itr in range(1, args.niters + 1):
             optimizer.zero_grad()
-            start = time.time()
             
-            loss, loss1, sigma_now, L2_value1, L2_value2 = train_model(mse,func,args,data_train,train_time,integral_time,sigma_now,options,device,itr, args.solver)
-
-            
+            loss, loss1, sigma_now, L2_value1, L2_value2, ode_times = train(mse,func,args,data_train,train_time,integral_time,sigma_now,options,device,itr)
+            times = times + ode_times
+            print(np.mean(times))
             loss.backward()
             optimizer.step()
             lr_adjust.step()
-            times.append(time.time()-start)
+
             LOSS.append(loss.item())
             Trans.append(loss1[-1].mean(0).item())
             Sigma.append(sigma_now)
@@ -87,11 +97,11 @@ if __name__ == '__main__':
             print('Iter: {}, loss: {:.4f}'.format(itr, loss.item()))
             
             
-            if itr % 50 == 0:
+            if itr % 200 == 0:
+                print(np.mean(times))
                 ckpt_path = os.path.join(args.save_dir, 'ckpt_itr{}.pth'.format(itr))
                 torch.save({'func_state_dict': func.state_dict()}, ckpt_path)
                 print('Iter {}, Stored ckpt at {}'.format(itr, ckpt_path))
-                print(np.mean(times))
                 
             
             
@@ -102,6 +112,12 @@ if __name__ == '__main__':
             torch.save({
                 'func_state_dict': func.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'LOSS': LOSS,
+                'TRANS': Trans,
+                'L2_1': L2_1,
+                'L2_2': L2_2,
+                'Sigma': Sigma,
+                'times': times,
             }, ckpt_path)
             print('Stored ckpt at {}'.format(ckpt_path))
     print('Training complete after {} iters.'.format(itr))
@@ -115,7 +131,8 @@ if __name__ == '__main__':
         'TRANS':Trans,
         'L2_1': L2_1,
         'L2_2': L2_2,
-        'Sigma': Sigma
+        'Sigma': Sigma,
+        'times': times,
     }, ckpt_path)
     print('Stored ckpt at {}'.format(ckpt_path))
 
